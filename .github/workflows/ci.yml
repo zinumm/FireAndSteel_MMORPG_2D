@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.101"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Test (if any)
+        shell: bash
+        run: |
+          if find . \( -name "*.Tests.csproj" -o -name "*Tests.csproj" \) | grep -q .; then
+            dotnet test -c Release --no-build
+          else
+            echo "No test projects yet."
+          fi
