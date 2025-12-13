@@ -1,0 +1,5 @@
+{
+  "mobs": [
+    { "id": "mob_rat", "name": "Rat", "hp": 10, "attack": 2 }
+  ]
+}

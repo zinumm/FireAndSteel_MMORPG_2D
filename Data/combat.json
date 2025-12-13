@@ -1,0 +1,4 @@
+{
+  "player": { "baseHp": 25, "baseAttack": 3 },
+  "rules": { "critChance": 0.05, "critMultiplier": 2.0 }
+}

@@ -1,0 +1,6 @@
+{
+  "items": [
+    { "id": "itm_potion_small", "name": "Small Potion", "maxStack": 20 },
+    { "id": "itm_coin", "name": "Coin", "maxStack": 9999 }
+  ]
+}

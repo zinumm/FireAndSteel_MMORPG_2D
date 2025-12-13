@@ -1,0 +1,11 @@
+# .NET build output
+**/bin/
+**/obj/
+
+# VS / VS Code
+.vs/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+{
+  "tables": [
+    {
+      "id": "drop_rat",
+      "entries": [
+        { "itemId": "itm_coin", "min": 1, "max": 3, "chance": 0.8 },
+        { "itemId": "itm_potion_small", "min": 1, "max": 1, "chance": 0.1 }
+      ]
+    }
+  ],
+  "mobToTable": [
+    { "mobId": "mob_rat", "tableId": "drop_rat" }
+  ]
+}

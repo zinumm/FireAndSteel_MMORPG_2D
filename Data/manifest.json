@@ -1,0 +1,6 @@
+{
+  "items": "items.json",
+  "mobs": "mobs.json",
+  "combat": "combat.json",
+  "drops": "drops.json"
+}
