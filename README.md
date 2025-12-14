@@ -48,3 +48,17 @@ dotnet run --project src/Client -c Release -- --config Config/runtime.json --spa
 - `Disconnect` (com `DisconnectReason`)
 
 O framing é por envelope fixo (`EnvelopeV1`) com `BodyLen` e leitura segura (`ReadExact`).
+
+## Como contribuir
+- Leia: CONTRIBUTING.md
+- Código de conduta: CODE_OF_CONDUCT.md
+- Segurança: SECURITY.md (não abra issue pública para vulnerabilidade)
+
+### Boas “primeiras issues”
+Procure labels:
+- good first issue
+- help wanted
+
+## Comunicação
+- Use Issues para trabalho e decisões técnicas.
+- (Opcional) Discussions para perguntas gerais e ideias.
