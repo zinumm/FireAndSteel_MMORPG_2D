@@ -15,10 +15,7 @@ static string GetArg(string[] args, string key, string fallback)
 var configPath = GetArg(args, "--config", Path.Combine("Config", "runtime.json"));
 var cfg = JsonConfig.LoadRuntime(configPath);
 
-// DATA bootstrap (trava server se inválido)
-var dataRoot = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "Data");
-dataRoot = Path.GetFullPath(dataRoot);
-
+var dataRoot = ResolveDataRoot();
 Console.WriteLine($"[Server] DataRoot: {dataRoot}");
 
 DataStore store;
@@ -52,11 +49,10 @@ var ip = IPAddress.Parse(cfg.Network.Host);
 var listener = new TcpListener(ip, cfg.Network.Port);
 
 var router = new MessageRouter();
-router.Register(MessageId.Ping, async (conn, env, body, ct) =>
+router.Register(MessageType.Ping, async (conn, env, body, ct) =>
 {
-    Console.WriteLine($"[Server] <- Ping seq={env.Seq} len={env.BodyLen}");
-    await conn.SendAsync(MessageId.Pong, Array.Empty<byte>(), ct);
-    Console.WriteLine("[Server] -> Pong");
+    // Sem spam de log por mensagem (Sprint 1)
+    await conn.SendAsync(MessageType.Pong, Array.Empty<byte>(), ct);
 });
 
 listener.Start();
@@ -72,38 +68,76 @@ try
         var tcp = await listener.AcceptTcpClientAsync(cts.Token);
         _ = Task.Run(async () =>
         {
-            Console.WriteLine("[Server] Client connected.");
+	            Console.WriteLine("[Server] Client connected.");
+	            string? disconnectNote = null;
             await using var conn = new Connection(tcp, new RateLimiter(maxMsgsPerSec: 60, maxBytesPerSec: 64 * 1024));
 
             try
             {
+                // 1) Handshake obrigatório (Sprint 1)
+                var (hsEnv, hsBody) = await conn.ReadAsync(cts.Token);
+                if (hsEnv.MessageType != MessageType.Handshake)
+                {
+                    Console.WriteLine("[Server] Bad handshake: primeiro pacote não é Handshake.");
+                    await conn.TrySendDisconnectAsync(DisconnectReason.BadHandshake, cts.Token);
+                    return;
+                }
+
+                var hs = Handshake.Read(hsBody);
+                if (hs.Stage != HandshakeStage.Request || hs.Version != ProtocolVersion.V0)
+                {
+                    Console.WriteLine($"[Server] Bad handshake: stage={hs.Stage} version={hs.Version}.");
+                    await conn.TrySendDisconnectAsync(DisconnectReason.BadHandshake, cts.Token);
+                    return;
+                }
+
+                var ack = new Handshake(ProtocolVersion.V0, hs.Nonce, HandshakeStage.Ack);
+                await conn.SendAsync(MessageType.Handshake, ack.ToBytes(), cts.Token);
+                Console.WriteLine("[Server] Handshake OK.");
+
+                // 2) Loop de mensagens
                 while (!cts.IsCancellationRequested)
                 {
                     var (env, body) = await conn.ReadAsync(cts.Token);
 
-                    var approxBytes = EnvelopeV1.HeaderSize + body.Length;
-                    if (!conn.RateLimiter.TryConsume(1, approxBytes))
-                        {
-                            Console.WriteLine("[Server] Rate limit excedido.");
-                            conn.Close();  // Fechar a conexão de forma limpa
-                            return;  // Evitar continuar processando a conexão
-                        }
+	                    if (env.MessageType == MessageType.Disconnect)
+                    {
+                        var d = Disconnect.Read(body);
+                        disconnectNote = $"[Server] Client disconnected (reason={d.Reason}).";
+                        return;
+                    }
 
                     await router.DispatchAsync(conn, env, body, cts.Token);
                 }
+            }
+            catch (RateLimitExceededException)
+            {
+                Console.WriteLine("[Server] Rate limit excedido.");
+                await conn.SendDisconnectAndCloseAsync(DisconnectReason.RateLimit);
+                Console.WriteLine("[Server] Client disconnected (reason=RateLimit).");
+                return;
+            }
+            catch (InvalidOperationException ex)
+            {
+	                disconnectNote = "[Server] Client disconnected (reason=ProtocolError).";
+                Console.WriteLine($"[Server] Protocol error: {ex.Message}");
+                await conn.TrySendDisconnectAsync(DisconnectReason.ProtocolError, cts.Token);
             }
             catch (OperationCanceledException) { }
             catch (IOException)
             {
                 // cliente encerrou a conexão (normal em console demo)
+	                disconnectNote ??= "[Server] Client disconnected (io).";
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Server] Conn drop: {ex.Message}");
             }
-
-            conn.Close();
-            Console.WriteLine("[Server] Client disconnected.");
+            finally
+            {
+                conn.Close();
+	                Console.WriteLine(disconnectNote ?? "[Server] Client disconnected.");
+            }
         }, cts.Token);
     }
 }
@@ -111,4 +145,23 @@ catch (OperationCanceledException) { }
 finally
 {
     listener.Stop();
+}
+
+static string ResolveDataRoot()
+{
+    var baseDir = AppContext.BaseDirectory;
+
+    var repoRoot = Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", ".."));
+    var candidates = new[]
+    {
+        Path.Combine(repoRoot, "Data"),
+        Path.Combine(repoRoot, "src", "Data"),
+    };
+
+    foreach (var c in candidates)
+        if (Directory.Exists(c))
+            return c;
+
+    throw new DirectoryNotFoundException(
+        "Pasta Data não encontrada. Tentativas:\n- " + string.Join("\n- ", candidates));
 }

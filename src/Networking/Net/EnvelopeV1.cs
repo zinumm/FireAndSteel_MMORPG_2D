@@ -12,15 +12,15 @@ public readonly struct EnvelopeV1
 
     public readonly ushort Version;
     public readonly ushort Flags;
-    public readonly MessageId MessageId;
+    public readonly MessageType MessageType;
     public readonly uint Seq;
     public readonly uint BodyLen;
 
-    public EnvelopeV1(ushort version, ushort flags, MessageId messageId, uint seq, uint bodyLen)
+    public EnvelopeV1(ushort version, ushort flags, MessageType messageType, uint seq, uint bodyLen)
     {
         Version = version;
         Flags = flags;
-        MessageId = messageId;
+        MessageType = messageType;
         Seq = seq;
         BodyLen = bodyLen;
     }
@@ -32,7 +32,7 @@ public readonly struct EnvelopeV1
 
         var version = BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(0, 2));
         var flags   = BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(2, 2));
-        var msgId   = (MessageId)BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(4, 2));
+        var msgId   = (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(4, 2));
         // reserved header.Slice(6,2)
         var seq     = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(8, 4));
         var bodyLen = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(12, 4));
@@ -47,7 +47,7 @@ public readonly struct EnvelopeV1
 
         BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(0, 2), Version);
         BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(2, 2), Flags);
-        BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(4, 2), (ushort)MessageId);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(4, 2), (ushort)MessageType);
         BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(6, 2), 0); // reserved
         BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(8, 4), Seq);
         BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(12, 4), BodyLen);

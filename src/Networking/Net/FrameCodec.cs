@@ -2,13 +2,13 @@ namespace FireAndSteel.Networking.Net;
 
 public static class FrameCodec
 {
-    public static byte[] Encode(MessageId id, uint seq, ReadOnlySpan<byte> body, ushort flags = 0)
+    public static byte[] Encode(MessageType type, uint seq, ReadOnlySpan<byte> body, ushort flags = 0)
     {
         if (body.Length > ProtocolConstants.MaxBodyBytes)
             throw new InvalidOperationException("Body excede limite.");
 
         var header = new byte[EnvelopeV1.HeaderSize];
-        var env = new EnvelopeV1(ProtocolConstants.ProtocolVersion, flags, id, seq, (uint)body.Length);
+        var env = new EnvelopeV1(ProtocolConstants.CurrentProtocolVersion, flags, type, seq, (uint)body.Length);
         env.Write(header);
 
         var frame = new byte[EnvelopeV1.HeaderSize + body.Length];
@@ -23,7 +23,7 @@ public static class FrameCodec
         var header = await ReadExactAsync(stream, EnvelopeV1.HeaderSize, ct);
         var env = EnvelopeV1.Read(header);
 
-        if (env.Version != ProtocolConstants.ProtocolVersion)
+        if (env.Version != ProtocolConstants.CurrentProtocolVersion)
             throw new InvalidOperationException($"Versão de protocolo inválida: {env.Version}");
 
         if (env.BodyLen > ProtocolConstants.MaxBodyBytes)
