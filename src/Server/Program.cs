@@ -1,9 +1,8 @@
-﻿using System.Net;
-using System.Net.Sockets;
+using FireAndSteel.Core.Config;
 using FireAndSteel.Core.Data;
 using FireAndSteel.Core.Data.Validation;
-using FireAndSteel.Core.Config;
 using FireAndSteel.Networking.Net;
+using FireAndSteel.Server.Net;
 
 static string GetArg(string[] args, string key, string fallback)
 {
@@ -12,8 +11,20 @@ static string GetArg(string[] args, string key, string fallback)
     return fallback;
 }
 
+static int GetPort(string[] args, RuntimeConfig cfg)
+{
+    var portStr = GetArg(args, "--port", cfg.Network.Port.ToString());
+    if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
+        throw new InvalidOperationException($"Port inválida: '{portStr}' (range 1..65535).");
+    return port;
+}
+
 var configPath = GetArg(args, "--config", Path.Combine("Config", "runtime.json"));
 var cfg = JsonConfig.LoadRuntime(configPath);
+
+// Overrides (Sprint 2)
+var host = GetArg(args, "--host", cfg.Network.Host);
+var port = GetPort(args, cfg);
 
 var dataRoot = ResolveDataRoot();
 Console.WriteLine($"[Server] DataRoot: {dataRoot}");
@@ -44,10 +55,6 @@ if (!vr.Ok)
 
 Console.WriteLine("[Server] DATA OK.");
 
-
-var ip = IPAddress.Parse(cfg.Network.Host);
-var listener = new TcpListener(ip, cfg.Network.Port);
-
 var router = new MessageRouter();
 router.Register(MessageType.Ping, async (conn, env, body, ct) =>
 {
@@ -55,96 +62,27 @@ router.Register(MessageType.Ping, async (conn, env, body, ct) =>
     await conn.SendAsync(MessageType.Pong, Array.Empty<byte>(), ct);
 });
 
-listener.Start();
-Console.WriteLine($"[Server] Listening on {cfg.Network.Host}:{cfg.Network.Port}");
-
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
+await using var server = new ServerHost(
+    host: host,
+    port: port,
+    router: router,
+    logger: msg => Console.WriteLine(msg),
+    handshakeTimeout: TimeSpan.FromSeconds(2));
+
+server.Start(cts.Token);
+
 try
 {
-    while (!cts.IsCancellationRequested)
-    {
-        var tcp = await listener.AcceptTcpClientAsync(cts.Token);
-        _ = Task.Run(async () =>
-        {
-	            Console.WriteLine("[Server] Client connected.");
-	            string? disconnectNote = null;
-            await using var conn = new Connection(tcp, new RateLimiter(maxMsgsPerSec: 60, maxBytesPerSec: 64 * 1024));
-
-            try
-            {
-                // 1) Handshake obrigatório (Sprint 1)
-                var (hsEnv, hsBody) = await conn.ReadAsync(cts.Token);
-                if (hsEnv.MessageType != MessageType.Handshake)
-                {
-                    Console.WriteLine("[Server] Bad handshake: primeiro pacote não é Handshake.");
-                    await conn.TrySendDisconnectAsync(DisconnectReason.BadHandshake, cts.Token);
-                    return;
-                }
-
-                var hs = Handshake.Read(hsBody);
-                if (hs.Stage != HandshakeStage.Request || hs.Version != ProtocolVersion.V0)
-                {
-                    Console.WriteLine($"[Server] Bad handshake: stage={hs.Stage} version={hs.Version}.");
-                    await conn.TrySendDisconnectAsync(DisconnectReason.BadHandshake, cts.Token);
-                    return;
-                }
-
-                var ack = new Handshake(ProtocolVersion.V0, hs.Nonce, HandshakeStage.Ack);
-                await conn.SendAsync(MessageType.Handshake, ack.ToBytes(), cts.Token);
-                Console.WriteLine("[Server] Handshake OK.");
-
-                // 2) Loop de mensagens
-                while (!cts.IsCancellationRequested)
-                {
-                    var (env, body) = await conn.ReadAsync(cts.Token);
-
-	                    if (env.MessageType == MessageType.Disconnect)
-                    {
-                        var d = Disconnect.Read(body);
-                        disconnectNote = $"[Server] Client disconnected (reason={d.Reason}).";
-                        return;
-                    }
-
-                    await router.DispatchAsync(conn, env, body, cts.Token);
-                }
-            }
-            catch (RateLimitExceededException)
-            {
-                Console.WriteLine("[Server] Rate limit excedido.");
-                await conn.SendDisconnectAndCloseAsync(DisconnectReason.RateLimit);
-                Console.WriteLine("[Server] Client disconnected (reason=RateLimit).");
-                return;
-            }
-            catch (InvalidOperationException ex)
-            {
-	                disconnectNote = "[Server] Client disconnected (reason=ProtocolError).";
-                Console.WriteLine($"[Server] Protocol error: {ex.Message}");
-                await conn.TrySendDisconnectAsync(DisconnectReason.ProtocolError, cts.Token);
-            }
-            catch (OperationCanceledException) { }
-            catch (IOException)
-            {
-                // cliente encerrou a conexão (normal em console demo)
-	                disconnectNote ??= "[Server] Client disconnected (io).";
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Server] Conn drop: {ex.Message}");
-            }
-            finally
-            {
-                conn.Close();
-	                Console.WriteLine(disconnectNote ?? "[Server] Client disconnected.");
-            }
-        }, cts.Token);
-    }
+    // mantém o processo vivo até Ctrl+C
+    await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
 }
 catch (OperationCanceledException) { }
 finally
 {
-    listener.Stop();
+    await server.StopAsync(CancellationToken.None);
 }
 
 static string ResolveDataRoot()

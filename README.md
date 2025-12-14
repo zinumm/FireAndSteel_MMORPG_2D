@@ -1,4 +1,4 @@
-# Fire&Steel — Sprint 1 (Networking v0)
+# Fire&Steel — Sprint 2 (Networking v0.1)
 
 ## Requisitos
 
@@ -8,6 +8,12 @@
 
 ```bash
 dotnet build -c Release
+```
+
+## Testes
+
+```bash
+dotnet test -c Release
 ```
 
 ## Rodar (demo)
@@ -23,10 +29,24 @@ Crie um arquivo `Config/runtime.json` (na raiz do repo) com o mínimo:
 }
 ```
 
+### Flags (Client/Server)
+
+- `--config <path>`: caminho do runtime.json (mantido)
+- `--host <host>`: override do host do config
+- `--port <port>`: override da porta do config
+
+**Regra:** `--host/--port` vencem o `runtime.json` quando informados.
+
 ### Server
 
 ```bash
 dotnet run --project src/Server -c Release -- --config Config/runtime.json
+```
+
+Override:
+
+```bash
+dotnet run --project src/Server -c Release -- --config Config/runtime.json --host 127.0.0.1 --port 7777
 ```
 
 ### Client
@@ -43,7 +63,7 @@ dotnet run --project src/Client -c Release -- --config Config/runtime.json --spa
 
 ## Protocolo v0
 
-- `Handshake` (obrigatório como 1ª mensagem)
+- `Handshake` (obrigatório como 1ª mensagem; timeout no server)
 - `Ping` / `Pong`
 - `Disconnect` (com `DisconnectReason`)
 

@@ -10,17 +10,31 @@ static string GetArg(string[] args, string key, string fallback)
     return fallback;
 }
 
+static int GetPort(string[] args, RuntimeConfig cfg)
+{
+    var portStr = GetArg(args, "--port", cfg.Network.Port.ToString());
+    if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
+        throw new InvalidOperationException($"Port inválida: '{portStr}' (range 1..65535).");
+    return port;
+}
+
 var configPath = GetArg(args, "--config", Path.Combine("Config", "runtime.json"));
 var cfg = JsonConfig.LoadRuntime(configPath);
+
+// Overrides (Sprint 2)
+var host = GetArg(args, "--host", cfg.Network.Host);
+var port = GetPort(args, cfg);
 
 var spam = args.Contains("--spam", StringComparer.OrdinalIgnoreCase);
 var count = int.TryParse(GetArg(args, "--count", spam ? "5000" : "25"), out var c) ? c : (spam ? 5000 : 25);
 var delayMs = int.TryParse(GetArg(args, "--delayMs", spam ? "0" : "10"), out var d) ? d : (spam ? 0 : 10);
 
-Console.WriteLine($"[Client] Connecting to {cfg.Network.Host}:{cfg.Network.Port} ...");
+Console.WriteLine($"[Client] Connecting to {host}:{port} ...");
 
 using var tcp = new TcpClient();
-await tcp.ConnectAsync(cfg.Network.Host, cfg.Network.Port);
+await tcp.ConnectAsync(host, port);
+Console.WriteLine("[Client] Connected.");
+
 await using var conn = new Connection(tcp);
 
 // 1) Handshake (Sprint 1)
@@ -128,4 +142,3 @@ finally
 }
 
 Console.WriteLine($"[Client] Sent={sent} Pongs={pongs}" + (reason is not null ? $" Reason={reason}" : ""));
-
