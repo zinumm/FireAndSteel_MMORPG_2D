@@ -1,9 +1,12 @@
-root = true
+﻿root = true
 
-[*.cs]
+[*]
 charset = utf-8
 end_of_line = lf
 insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.cs]
 indent_style = space
 indent_size = 4
 
@@ -15,3 +18,25 @@ dotnet_style_qualification_for_field = false:suggestion
 dotnet_style_qualification_for_property = false:suggestion
 dotnet_style_qualification_for_method = false:suggestion
 dotnet_style_qualification_for_event = false:suggestion
+
+# Quality Gate v0.1 — bloquear só Security
+dotnet_analyzer_diagnostic.category-Security.severity = error
+
+# De-noise (Sprint 3): reduzir spam no CI (tratar depois em refactor dedicado)
+dotnet_diagnostic.CA1805.severity = suggestion
+dotnet_diagnostic.CA1051.severity = suggestion
+dotnet_diagnostic.CA1869.severity = suggestion
+dotnet_diagnostic.CA1836.severity = suggestion
+dotnet_diagnostic.CA1305.severity = suggestion
+
+# Nullable: manter visível por enquanto
+dotnet_diagnostic.CS8600.severity = warning
+
+[tests/**/*.cs]
+dotnet_diagnostic.CA1707.severity = silent
+
+[*.{csproj,props,targets,slnx,yml,yaml,json,md}]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
