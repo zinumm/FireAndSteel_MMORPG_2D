@@ -30,4 +30,5 @@ jobs:
       - name: Restore
         run: dotnet restore FireAndSteel.slnx
       - name: Test
-        run: dotnet test tests/Networking.Tests/Networking.Tests.csproj -c Release --no-build
+        run: dotnet test tests/Networking.Tests/Networking.Tests.csproj -c Release --no-restore
+
