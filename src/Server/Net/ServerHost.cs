@@ -1,15 +1,25 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using FireAndSteel.Networking.Net;
 
 namespace FireAndSteel.Server.Net;
 
 public sealed class ServerHost : IAsyncDisposable
 {
+    private const int MaxTrackedClientTasks = 10_000;
+    private static readonly TimeSpan DefaultClientDrainTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan DefaultReadIdleTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultWriteTimeout = TimeSpan.FromSeconds(5);
+
     private readonly string _host;
     private readonly int _port;
+    private int _stopOnce;
     private readonly TimeSpan _handshakeTimeout;
+    private readonly TimeSpan _readIdleTimeout;
+    private readonly TimeSpan _writeTimeout;
+    private readonly TimeSpan _clientDrainTimeout;
     private readonly Action<string> _log;
     private readonly MessageRouter _router;
 
@@ -18,23 +28,32 @@ public sealed class ServerHost : IAsyncDisposable
     private Task? _acceptLoopTask;
 
     private readonly ConcurrentDictionary<long, Task> _clientTasks = new();
+    private readonly ServerMetrics _metrics = new();
 
     public SessionManager Sessions { get; } = new();
 
     public IPEndPoint? BoundEndPoint { get; private set; }
+
+    internal ServerMetrics Metrics => _metrics;
 
     public ServerHost(
         string host,
         int port,
         MessageRouter router,
         Action<string>? logger = null,
-        TimeSpan? handshakeTimeout = null)
+        TimeSpan? handshakeTimeout = null,
+        TimeSpan? readIdleTimeout = null,
+        TimeSpan? writeTimeout = null,
+        TimeSpan? clientDrainTimeout = null)
     {
         _host = host;
         _port = port;
         _router = router ?? throw new ArgumentNullException(nameof(router));
         _log = logger ?? (_ => { });
         _handshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(2);
+        _readIdleTimeout = readIdleTimeout ?? DefaultReadIdleTimeout;
+        _writeTimeout = writeTimeout ?? DefaultWriteTimeout;
+        _clientDrainTimeout = clientDrainTimeout ?? DefaultClientDrainTimeout;
     }
 
     public void Start(CancellationToken ct = default)
@@ -46,8 +65,19 @@ public sealed class ServerHost : IAsyncDisposable
         _listener = new TcpListener(ip, _port);
         _listener.Start();
 
-        BoundEndPoint = (IPEndPoint)_listener.LocalEndpoint;
-        _log($"[Server] Listening on {BoundEndPoint.Address}:{BoundEndPoint.Port}");
+        var local = _listener.LocalEndpoint;
+        if (local is null)
+        throw new InvalidOperationException("Listener LocalEndpoint nulo após Start().");
+
+        if (local is not IPEndPoint ep)
+        throw new InvalidOperationException($"LocalEndpoint inesperado: {local.GetType().Name}");
+
+        BoundEndPoint = ep;
+
+        LogInfo("server_start",
+            ("host", _host),
+            ("port", _port),
+            ("bound", $"{BoundEndPoint.Address}:{BoundEndPoint.Port}"));
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _acceptLoopTask = AcceptLoopAsync(_cts.Token);
@@ -55,22 +85,63 @@ public sealed class ServerHost : IAsyncDisposable
 
     public async Task StopAsync(CancellationToken ct = default)
     {
+        if (Interlocked.Exchange(ref _stopOnce, 1) != 0)
+            return;
+        
         if (_cts is null)
             return;
+
+        LogInfo("server_stop_begin",
+            ("trackedTasks", _clientTasks.Count),
+            ("sessions", Sessions.Count));
 
         try { _cts.Cancel(); } catch { }
 
         try { _listener?.Stop(); } catch { }
+        _listener = null;
 
         if (_acceptLoopTask is not null)
+            await AwaitQuietlyAsync(_acceptLoopTask, ct).ConfigureAwait(false);
+
+        await DrainClientsBestEffortAsync(ct).ConfigureAwait(false);
+
+        LogInfo("server_stop_end",
+            ("trackedTasks", _clientTasks.Count),
+            ("sessions", Sessions.Count),
+            ("currentConnections", _metrics.CurrentConnections));
+    }
+
+    private async Task DrainClientsBestEffortAsync(CancellationToken ct)
+    {
+        var tasks = _clientTasks.Values.ToArray();
+        if (tasks.Length == 0)
+            return;
+
+        // Evita Task.WhenAll() falhar por exceções e mantém tudo "observed".
+        var swallow = new Task[tasks.Length];
+        for (var i = 0; i < tasks.Length; i++)
         {
-            try { await _acceptLoopTask; } catch { }
+            var t = tasks[i];
+            swallow[i] = t.ContinueWith(
+                _ => { },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
 
-        // aguarda handlers em andamento
-        if (_clientTasks.Count > 0)
+        var all = Task.WhenAll(swallow);
+        var timeout = Task.Delay(_clientDrainTimeout, ct);
+
+        var completed = await Task.WhenAny(all, timeout).ConfigureAwait(false);
+        if (completed != all)
         {
-            try { await Task.WhenAll(_clientTasks.Values); } catch { }
+            LogWarn("server_stop_timeout",
+                ("timeoutMs", (long)_clientDrainTimeout.TotalMilliseconds),
+                ("remaining", _clientTasks.Count));
+        }
+        else
+        {
+            await AwaitQuietlyAsync(all, ct).ConfigureAwait(false);
         }
     }
 
@@ -85,30 +156,55 @@ public sealed class ServerHost : IAsyncDisposable
 
             try
             {
-                tcp = await _listener.AcceptTcpClientAsync(ct);
+                tcp = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) { break; }
-            catch (ObjectDisposedException) { break; }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (SocketException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+
+            if (_clientTasks.Count >= MaxTrackedClientTasks)
+            {
+                LogWarn("client_rejected",
+                    ("reason", "too_many_tracked_tasks"),
+                    ("limit", MaxTrackedClientTasks));
+                try { tcp.Close(); } catch { }
+                continue;
+            }
 
             var session = Sessions.Register(tcp);
-           session.State = SessionState.Connected;
+            session.State = SessionState.Connected;
 
-            _log($"[Server] Connect {session.RemoteEndPoint} (sessionId={session.SessionId})");
+            _metrics.OnAccept();
 
-            Task task = HandleClientAsync(tcp, session, ct);   // garante não-anulável aqui
+            LogInfo("client_connect",
+                ("sessionId", session.SessionId),
+                ("remote", session.RemoteEndPoint?.ToString() ?? "null"),
+                ("current", _metrics.CurrentConnections));
+
+            var task = HandleClientAsync(tcp, session, ct);
             _clientTasks[session.SessionId] = task;
 
-            _ = task.ContinueWith(_ =>
-            {
-            _clientTasks.TryRemove(session.SessionId, out Task? _);
-            }, CancellationToken.None);
+            _ = task.ContinueWith(
+                _ => _clientTasks.TryRemove(session.SessionId, out Task? _),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
     }
 
-
     private async Task HandleClientAsync(TcpClient tcp, Session session, CancellationToken serverCt)
     {
-        string? disconnectLog = null;
+        string? disconnectEvt = null;
+        DisconnectReason? disconnectReason = null;
 
         await using var conn = new Connection(
             tcp,
@@ -123,7 +219,9 @@ public sealed class ServerHost : IAsyncDisposable
                 using var hsCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
                 hsCts.CancelAfter(_handshakeTimeout);
 
-                var (hsEnv, hsBody) = await conn.ReadAsync(hsCts.Token);
+                var (hsEnv, hsBody) = await conn.ReadAsync(hsCts.Token).ConfigureAwait(false);
+                _metrics.IncMessagesIn();
+
                 if (hsEnv.MessageType != MessageType.Handshake)
                     throw new BadHandshakeException("primeiro pacote não é Handshake");
 
@@ -131,28 +229,35 @@ public sealed class ServerHost : IAsyncDisposable
             }
             catch (OperationCanceledException) when (!serverCt.IsCancellationRequested)
             {
-                await CloseAsync(conn, session, DisconnectReason.BadHandshake, "Handshake timeout.");
-                disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=BadHandshake)";
+                _metrics.IncParseError();
+                await CloseAsync(conn, session, DisconnectReason.BadHandshake, "handshake_timeout").ConfigureAwait(false);
+                disconnectEvt = "client_disconnect";
+                disconnectReason = DisconnectReason.BadHandshake;
                 return;
             }
-            catch (BadHandshakeException ex)
+            catch (BadHandshakeException)
             {
-                await CloseAsync(conn, session, DisconnectReason.BadHandshake, $"Bad handshake: {ex.Message}");
-                disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=BadHandshake)";
+                _metrics.IncParseError();
+                await CloseAsync(conn, session, DisconnectReason.BadHandshake, "bad_handshake").ConfigureAwait(false);
+                disconnectEvt = "client_disconnect";
+                disconnectReason = DisconnectReason.BadHandshake;
                 return;
             }
-            catch (InvalidOperationException ex)
+            catch (InvalidOperationException)
             {
-                await CloseAsync(conn, session, DisconnectReason.BadHandshake, $"Bad handshake: {ex.Message}");
-                disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=BadHandshake)";
+                _metrics.IncParseError();
+                await CloseAsync(conn, session, DisconnectReason.BadHandshake, "bad_handshake").ConfigureAwait(false);
+                disconnectEvt = "client_disconnect";
+                disconnectReason = DisconnectReason.BadHandshake;
                 return;
             }
 
             if (hs.Stage != HandshakeStage.Request || hs.Version != ProtocolVersion.V0)
             {
-                await CloseAsync(conn, session, DisconnectReason.BadHandshake,
-                    $"Bad handshake: stage={hs.Stage} version={hs.Version}");
-                disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=BadHandshake)";
+                _metrics.IncParseError();
+                await CloseAsync(conn, session, DisconnectReason.BadHandshake, "bad_handshake").ConfigureAwait(false);
+                disconnectEvt = "client_disconnect";
+                disconnectReason = DisconnectReason.BadHandshake;
                 return;
             }
 
@@ -161,71 +266,154 @@ public sealed class ServerHost : IAsyncDisposable
             session.State = SessionState.Handshaken;
 
             var ack = new Handshake(hs.Version, hs.Nonce, HandshakeStage.Ack);
-            await conn.SendAsync(MessageType.Handshake, ack.ToBytes(), serverCt);
+            if (!await TrySendAsync(conn, MessageType.Handshake, ack.ToBytes(), serverCt).ConfigureAwait(false))
+            {
+                disconnectEvt = "client_disconnect";
+                disconnectReason = DisconnectReason.Unknown;
+                return;
+            }
 
-            _log($"[Server] Handshake OK (sessionId={session.SessionId} v={hs.Version})");
+            LogInfo("handshake_ok",
+                ("sessionId", session.SessionId),
+                ("v", hs.Version));
 
             // 2) Loop de mensagens por conexão
             while (!serverCt.IsCancellationRequested)
             {
-                var (env, body) = await conn.ReadAsync(serverCt);
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+                readCts.CancelAfter(_readIdleTimeout);
+
+                var (env, body) = await conn.ReadAsync(readCts.Token).ConfigureAwait(false);
+                _metrics.IncMessagesIn();
 
                 if (env.MessageType == MessageType.Disconnect)
                 {
                     var d = Disconnect.Read(body);
-                    _log($"[Server] Client requested disconnect (sessionId={session.SessionId} reason={d.Reason})");
-                    await CloseAsync(conn, session, DisconnectReason.ClientClosed, null);
-                    disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=ClientClosed)";
+
+                    LogInfo("client_disconnect_request",
+                        ("sessionId", session.SessionId),
+                        ("reason", d.Reason));
+
+                    await CloseAsync(conn, session, DisconnectReason.ClientClosed, "client_closed").ConfigureAwait(false);
+                    disconnectEvt = "client_disconnect";
+                    disconnectReason = DisconnectReason.ClientClosed;
                     return;
                 }
 
-                await _router.DispatchAsync(conn, env, body, serverCt);
+                await _router.DispatchAsync(conn, env, body, serverCt).ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException) when (!serverCt.IsCancellationRequested)
+        {
+            // Timeout de leitura (idle)
+            await CloseAsync(conn, session, DisconnectReason.Unknown, "read_idle_timeout").ConfigureAwait(false);
+            disconnectEvt = "client_disconnect";
+            disconnectReason = DisconnectReason.Unknown;
         }
         catch (RateLimitExceededException)
         {
-            await CloseAsync(conn, session, DisconnectReason.RateLimit, "Rate limit excedido.");
-            disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=RateLimit)";
+            await CloseAsync(conn, session, DisconnectReason.RateLimit, "rate_limit").ConfigureAwait(false);
+            disconnectEvt = "client_disconnect";
+            disconnectReason = DisconnectReason.RateLimit;
         }
         catch (InvalidOperationException ex)
         {
-            await CloseAsync(conn, session, DisconnectReason.ProtocolError, $"Protocol error: {ex.Message}");
-            disconnectLog = $"[Server] Disconnect (sessionId={session.SessionId} reason=ProtocolError)";
+            _metrics.IncParseError();
+            LogWarn("protocol_error",
+                ("sessionId", session.SessionId),
+                ("msg", ex.Message));
+
+            await CloseAsync(conn, session, DisconnectReason.ProtocolError, "protocol_error").ConfigureAwait(false);
+            disconnectEvt = "client_disconnect";
+            disconnectReason = DisconnectReason.ProtocolError;
         }
-        catch (IOException)
+        catch (IOException ex)
         {
-            disconnectLog ??= $"[Server] Disconnect (sessionId={session.SessionId} io)";
+            _metrics.IncIoError();
+            LogWarn("io_error",
+                ("sessionId", session.SessionId),
+                ("msg", ex.Message));
+
+            disconnectEvt ??= "client_disconnect";
+            disconnectReason ??= DisconnectReason.Unknown;
         }
         catch (OperationCanceledException) when (serverCt.IsCancellationRequested)
         {
             // shutdown
-            await CloseAsync(conn, session, DisconnectReason.ServerShutdown, null);
-            disconnectLog ??= $"[Server] Disconnect (sessionId={session.SessionId} reason=ServerShutdown)";
+            await CloseAsync(conn, session, DisconnectReason.ServerShutdown, null).ConfigureAwait(false);
+            disconnectEvt ??= "client_disconnect";
+            disconnectReason ??= DisconnectReason.ServerShutdown;
         }
         catch (Exception ex)
         {
-            disconnectLog ??= $"[Server] Disconnect (sessionId={session.SessionId} err={ex.GetType().Name})";
-            _log($"[Server] Conn drop (sessionId={session.SessionId}): {ex.Message}");
+            _metrics.IncUnhandledError();
+            LogError("unhandled_error", ex,
+                ("sessionId", session.SessionId));
+
+            disconnectEvt ??= "client_disconnect";
+            disconnectReason ??= DisconnectReason.Unknown;
         }
         finally
         {
             session.State = SessionState.Closed;
             Sessions.TryRemove(session.SessionId, out _);
 
-            if (disconnectLog is not null)
-                _log(disconnectLog);
+            _metrics.OnDisconnect();
+
+            if (disconnectEvt is not null)
+            {
+                LogInfo(disconnectEvt,
+                    ("sessionId", session.SessionId),
+                    ("reason", disconnectReason?.ToString() ?? "null"),
+                    ("current", _metrics.CurrentConnections));
+            }
         }
     }
 
-    private async Task CloseAsync(Connection conn, Session session, DisconnectReason reason, string? logLine)
+    private async Task CloseAsync(Connection conn, Session session, DisconnectReason reason, string? evt)
     {
         session.State = SessionState.Closing;
 
-        if (!string.IsNullOrWhiteSpace(logLine))
-            _log($"[Server] {logLine} (sessionId={session.SessionId})");
+        if (!string.IsNullOrWhiteSpace(evt))
+            LogInfo(evt, ("sessionId", session.SessionId));
 
-        await conn.SendDisconnectAndCloseAsync(reason);
+        // Contabiliza como "tentativa" de envio (best-effort). Para contagem exata, precisaria instrumentar o Connection.
+        _metrics.IncMessagesOut();
+        await conn.SendDisconnectAndCloseAsync(reason).ConfigureAwait(false);
+
         session.State = SessionState.Closed;
+    }
+
+    private async Task<bool> TrySendAsync(Connection conn, MessageType type, byte[] body, CancellationToken serverCt)
+    {
+        using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+        sendCts.CancelAfter(_writeTimeout);
+
+        try
+        {
+            _metrics.IncMessagesOut();
+            await conn.SendAsync(type, body, sendCts.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (!serverCt.IsCancellationRequested)
+        {
+            LogWarn("write_timeout",
+                ("type", type),
+                ("timeoutMs", (long)_writeTimeout.TotalMilliseconds));
+            return false;
+        }
+    }
+
+    private static async Task AwaitQuietlyAsync(Task task, CancellationToken ct)
+    {
+        try
+        {
+            await task.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // intentionally ignored
+        }
     }
 
     private static IPAddress ResolveIp(string host)
@@ -246,8 +434,67 @@ public sealed class ServerHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
+        await StopAsync().ConfigureAwait(false);
         try { _cts?.Dispose(); } catch { }
+    }
+
+    private void LogInfo(string evt, params (string Key, object? Value)[] fields)
+        => _log(FormatLog("INFO", evt, fields));
+
+    private void LogWarn(string evt, params (string Key, object? Value)[] fields)
+        => _log(FormatLog("WARN", evt, fields));
+
+    private void LogError(string evt, Exception ex, params (string Key, object? Value)[] fields)
+    {
+        var merged = new (string Key, object? Value)[fields.Length + 2];
+        for (var i = 0; i < fields.Length; i++) merged[i] = fields[i];
+        merged[fields.Length] = ("exType", ex.GetType().Name);
+        merged[fields.Length + 1] = ("exMsg", ex.Message);
+        _log(FormatLog("ERROR", evt, merged));
+    }
+
+    private static string FormatLog(string level, string evt, (string Key, object? Value)[] fields)
+    {
+        var sb = new StringBuilder(256);
+        sb.Append("ts=").Append(DateTimeOffset.UtcNow.ToString("O"))
+          .Append(" level=").Append(level)
+          .Append(" evt=").Append(evt);
+
+        foreach (var (k, v) in fields)
+        {
+            if (string.IsNullOrWhiteSpace(k)) continue;
+            sb.Append(' ').Append(SanitizeKey(k)).Append('=');
+            AppendValue(sb, v);
+        }
+
+        return sb.ToString();
+    }
+
+    private static string SanitizeKey(string key)
+    {
+        var sb = new StringBuilder(key.Length);
+        foreach (var ch in key)
+        {
+            if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-') sb.Append(ch);
+            else sb.Append('_');
+        }
+        return sb.ToString();
+    }
+
+    private static void AppendValue(StringBuilder sb, object? value)
+    {
+        if (value is null) { sb.Append("null"); return; }
+
+        if (value is string s)
+        {
+            if (s.Length == 0) { sb.Append("\"\""); return; }
+            var needsQuote = s.IndexOfAny(new[] { ' ', '\t', '\r', '\n', '"' }) >= 0;
+            if (!needsQuote) { sb.Append(s); return; }
+            sb.Append('"').Append(s.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
+            return;
+        }
+
+        sb.Append(value);
     }
 
     private sealed class BadHandshakeException : Exception
