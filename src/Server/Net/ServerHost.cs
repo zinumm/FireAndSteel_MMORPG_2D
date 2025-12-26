@@ -81,7 +81,8 @@ public sealed class ServerHost : IAsyncDisposable
 
         while (!ct.IsCancellationRequested)
         {
-            TcpClient? tcp = null;
+            TcpClient tcp;
+
             try
             {
                 tcp = await _listener.AcceptTcpClientAsync(ct);
@@ -90,19 +91,20 @@ public sealed class ServerHost : IAsyncDisposable
             catch (ObjectDisposedException) { break; }
 
             var session = Sessions.Register(tcp);
-            session.State = SessionState.Connected;
+           session.State = SessionState.Connected;
 
             _log($"[Server] Connect {session.RemoteEndPoint} (sessionId={session.SessionId})");
 
-            var task = HandleClientAsync(tcp, session, ct);
+            Task task = HandleClientAsync(tcp, session, ct);   // garante não-anulável aqui
             _clientTasks[session.SessionId] = task;
 
             _ = task.ContinueWith(_ =>
             {
-                _clientTasks.TryRemove(session.SessionId, out _);
+            _clientTasks.TryRemove(session.SessionId, out Task? _);
             }, CancellationToken.None);
         }
     }
+
 
     private async Task HandleClientAsync(TcpClient tcp, Session session, CancellationToken serverCt)
     {
