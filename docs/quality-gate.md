@@ -5,6 +5,7 @@
   - `dotnet build -c Release`
 - Testes (Release):
   - `dotnet test -c Release`
+  - (inclui `tests/Networking.Tests` e `tests/Server.Tests`)
 
 ## Política de warnings
 - **Server**: warnings de nulabilidade (CS86xx) são tratados como **erro**.

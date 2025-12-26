@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using FireAndSteel.Networking.Net;
+using FireAndSteel.Server.Observability;
 
 namespace FireAndSteel.Server.Net;
 
@@ -12,6 +13,11 @@ public sealed class ServerHost : IAsyncDisposable
     private static readonly TimeSpan DefaultClientDrainTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan DefaultReadIdleTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DefaultWriteTimeout = TimeSpan.FromSeconds(5);
+
+
+    private const string MetricsSnapshotEnabledEnv = "FNS_SERVER_METRICS_SNAPSHOT_ENABLED";
+    private const string MetricsSnapshotIntervalSecondsEnv = "FNS_SERVER_METRICS_SNAPSHOT_INTERVAL_SECONDS";
+    private static readonly TimeSpan DefaultMetricsSnapshotInterval = TimeSpan.FromSeconds(10);
 
     private readonly string _host;
     private readonly int _port;
@@ -26,6 +32,12 @@ public sealed class ServerHost : IAsyncDisposable
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
+
+
+    private CancellationTokenSource? _metricsSnapshotCts;
+    private Task? _metricsSnapshotTask;
+    private bool _metricsSnapshotEnabled;
+    private TimeSpan _metricsSnapshotInterval = DefaultMetricsSnapshotInterval;
 
     private readonly ConcurrentDictionary<long, Task> _clientTasks = new();
     private readonly ServerMetrics _metrics = new();
@@ -81,6 +93,9 @@ public sealed class ServerHost : IAsyncDisposable
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _acceptLoopTask = AcceptLoopAsync(_cts.Token);
+
+
+        StartMetricsSnapshotLoop();
     }
 
     public async Task StopAsync(CancellationToken ct = default)
@@ -96,6 +111,9 @@ public sealed class ServerHost : IAsyncDisposable
             ("sessions", Sessions.Count));
 
         try { _cts.Cancel(); } catch { }
+
+
+        await StopMetricsSnapshotLoopAsync(ct).ConfigureAwait(false);
 
         try { _listener?.Stop(); } catch { }
         _listener = null;
@@ -430,6 +448,101 @@ public sealed class ServerHost : IAsyncDisposable
         if (any is not null) return any;
 
         throw new InvalidOperationException($"Não foi possível resolver host '{host}'.");
+    }
+
+
+
+    private void StartMetricsSnapshotLoop()
+    {
+        _metricsSnapshotEnabled = GetEnvBool(MetricsSnapshotEnabledEnv, defaultValue: false);
+        _metricsSnapshotInterval = GetEnvTimeSpanSeconds(MetricsSnapshotIntervalSecondsEnv, DefaultMetricsSnapshotInterval);
+
+        if (!_metricsSnapshotEnabled)
+            return;
+
+        if (_cts is null)
+            return;
+
+        _metricsSnapshotCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        _metricsSnapshotTask = MetricsSnapshotLoopAsync(_metricsSnapshotCts.Token);
+    }
+
+    private async Task StopMetricsSnapshotLoopAsync(CancellationToken ct)
+    {
+        try { _metricsSnapshotCts?.Cancel(); } catch { }
+
+        if (_metricsSnapshotTask is not null)
+            await AwaitQuietlyAsync(_metricsSnapshotTask, ct).ConfigureAwait(false);
+
+        try { _metricsSnapshotCts?.Dispose(); } catch { }
+        _metricsSnapshotCts = null;
+        _metricsSnapshotTask = null;
+    }
+
+    private async Task MetricsSnapshotLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(_metricsSnapshotInterval);
+
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                var snap = ServerMetricsSnapshot.From(_metrics);
+
+                LogInfo("server_metrics",
+                    ("currentConnections", snap.currentConnections),
+                    ("totalConnections", snap.totalConnections),
+                    ("totalDisconnects", snap.totalDisconnects),
+                    ("messagesIn", snap.messagesIn),
+                    ("messagesOut", snap.messagesOut),
+                    ("ioErrors", snap.ioErrors),
+                    ("parseErrors", snap.parseErrors),
+                    ("unhandledErrors", snap.unhandledErrors));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // shutdown
+        }
+        catch (Exception ex)
+        {
+            LogError("metrics_loop_unhandled", ex);
+        }
+    }
+
+    private static bool GetEnvBool(string name, bool defaultValue)
+    {
+        var v = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(v))
+            return defaultValue;
+
+        if (bool.TryParse(v, out var b))
+            return b;
+
+        // compat: 0/1
+        if (v == "1") return true;
+        if (v == "0") return false;
+
+        return defaultValue;
+    }
+
+    private static TimeSpan GetEnvTimeSpanSeconds(string name, TimeSpan defaultValue)
+    {
+        var v = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(v))
+            return defaultValue;
+
+        if (!int.TryParse(v, out var s))
+            return defaultValue;
+
+        if (s < 1)
+            return defaultValue;
+
+        // upper bound conservador: evita intervalos absurdos por erro de config
+        if (s > 3600)
+            s = 3600;
+
+        return TimeSpan.FromSeconds(s);
     }
 
     public async ValueTask DisposeAsync()
