@@ -15,6 +15,7 @@ public sealed class ServerHost : IAsyncDisposable
 
     private readonly string _host;
     private readonly int _port;
+    private int _stopOnce;
     private readonly TimeSpan _handshakeTimeout;
     private readonly TimeSpan _readIdleTimeout;
     private readonly TimeSpan _writeTimeout;
@@ -84,6 +85,9 @@ public sealed class ServerHost : IAsyncDisposable
 
     public async Task StopAsync(CancellationToken ct = default)
     {
+        if (Interlocked.Exchange(ref _stopOnce, 1) != 0)
+            return;
+        
         if (_cts is null)
             return;
 
