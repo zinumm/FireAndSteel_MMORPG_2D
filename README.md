@@ -1,84 +1,32 @@
-# Fire&Steel — Sprint 2 (Networking v0.1)
+# Fire & Steel — 2D MMORPG (C# / .NET)
 
-## Requisitos
+Projeto de estudo e construção incremental de um MMORPG 2D (estilo OT/Tibia-like), com arquitetura **Client/Server** e foco em engenharia: CI, testes, qualidade, incrementos pequenos e rastreáveis.
 
-- .NET SDK **10.0.101** (ver `global.json`)
+## Status atual (main)
+- CI: **build + test** (GitHub Actions) ✅
+- Qualidade (Server): **nullable warnings como erro** ✅
+- Confiabilidade (Server Ops v0.4): **shutdown limpo e idempotente + metrics snapshot periódico + guardrails de lifecycle** ✅
 
-## Build
+---
 
-```bash
-dotnet build -c Release
-```
+## Stack
+- C# / .NET 10
+- GitHub Actions (CI)
+- VS Code (dev)
 
-## Testes
+---
 
-```bash
-dotnet test -c Release
-```
+## Operação (Server)
+### Logs principais
+- `evt=server_start`
+- `evt=server_stop_begin`
+- `evt=server_stop_end`
+- `evt=server_metrics` (snapshot periódico de métricas)
 
-## Rodar (demo)
+### Habilitar snapshot periódico de métricas (Server-only)
+Por padrão: **desligado**.
 
-Crie um arquivo `Config/runtime.json` (na raiz do repo) com o mínimo:
-
-```json
-{
-  "network": {
-    "host": "127.0.0.1",
-    "port": 7777
-  }
-}
-```
-
-### Flags (Client/Server)
-
-- `--config <path>`: caminho do runtime.json (mantido)
-- `--host <host>`: override do host do config
-- `--port <port>`: override da porta do config
-
-**Regra:** `--host/--port` vencem o `runtime.json` quando informados.
-
-### Server
-
-```bash
-dotnet run --project src/Server -c Release -- --config Config/runtime.json
-```
-
-Override:
-
-```bash
-dotnet run --project src/Server -c Release -- --config Config/runtime.json --host 127.0.0.1 --port 7777
-```
-
-### Client
-
-```bash
-dotnet run --project src/Client -c Release -- --config Config/runtime.json
-```
-
-Para forçar o rate limit (teste de desconexão):
-
-```bash
-dotnet run --project src/Client -c Release -- --config Config/runtime.json --spam
-```
-
-## Protocolo v0
-
-- `Handshake` (obrigatório como 1ª mensagem; timeout no server)
-- `Ping` / `Pong`
-- `Disconnect` (com `DisconnectReason`)
-
-O framing é por envelope fixo (`EnvelopeV1`) com `BodyLen` e leitura segura (`ReadExact`).
-
-## Como contribuir
-- Leia: CONTRIBUTING.md
-- Código de conduta: CODE_OF_CONDUCT.md
-- Segurança: SECURITY.md (não abra issue pública para vulnerabilidade)
-
-### Boas “primeiras issues”
-Procure labels:
-- good first issue
-- help wanted
-
-## Comunicação
-- Use Issues para trabalho e decisões técnicas.
-- (Opcional) Discussions para perguntas gerais e ideias.
+**Windows (PowerShell):**
+```powershell
+$env:FNS_SERVER_METRICS_SNAPSHOT_ENABLED="true"
+$env:FNS_SERVER_METRICS_SNAPSHOT_INTERVAL_SECONDS="10"
